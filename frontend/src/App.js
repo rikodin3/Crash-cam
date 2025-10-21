@@ -1,12 +1,216 @@
-import logo from './logo.svg';
-import './App.css';
 import React, { useState, useRef } from 'react';
 import { Upload, Video, AlertCircle, CheckCircle, Loader, Play, X, Download } from 'lucide-react';
 
 function App() {
+  const [videoFile, setVideoFile] = useState(null);
+  const [videoURL, setVideoURL] = useState(null);
+  const [frames, setFrames] = useState([]);
+  const [processing, setProcessing] = useState(false);
+  const [predicting, setPredicting] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [result, setResult] = useState(null);
+  const videoRef = useRef(null);
+  const canvasRef = useRef(null);
+  const fileInputRef = useRef(null);
+
+  const handleFileChange = (e) => {
+  const file = e.target.files[0];
+  if (file && file.type.startsWith('video/')) {
+    setVideoFile(file);
+    
+    // Revoke old URL to prevent memory leaks
+    if (videoURL) {
+      URL.revokeObjectURL(videoURL);
+    }
+    
+    const url = URL.createObjectURL(file);
+    setVideoURL(url);
+    setFrames([]);
+    setResult(null);
+    setProgress(0);
+    
+    console.log('Video loaded:', file.name, 'Type:', file.type, 'Size:', file.size);
+  } else {
+    alert('Please select a valid video file (MP4, WebM, AVI, MOV)');
+  }
+};
+
+  const extractFrames = async () => {
+    if (!videoFile || !videoRef.current) return;
+
+    setProcessing(true);
+    setProgress(0);
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    
+    const extractedFrames = [];
+    const frameCount = 60;
+
+    return new Promise((resolve) => {
+      video.onloadedmetadata = () => {
+        const duration = video.duration;
+        const interval = duration / frameCount;
+        let currentFrame = 0;
+
+        // Set canvas to 224x224 as required by your model
+        canvas.width = 224;
+        canvas.height = 224;
+
+        const captureFrame = () => {
+          if (currentFrame >= frameCount) {
+            setFrames(extractedFrames);
+            setProcessing(false);
+            setProgress(100);
+            resolve();
+            return;
+          }
+
+          video.currentTime = currentFrame * interval;
+        };
+
+        video.onseeked = () => {
+          // Draw video frame centered and scaled to 224x224
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          
+          // Get image data for the frame
+          const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          const frameData = canvas.toDataURL('image/jpeg', 0.95);
+          
+          extractedFrames.push({
+            dataURL: frameData,
+            imageData: imageData
+          });
+          
+          currentFrame++;
+          setProgress(Math.round((currentFrame / frameCount) * 100));
+          
+          setTimeout(captureFrame, 50);
+        };
+
+        captureFrame();
+      };
+
+      video.load();
+    });
+  };
+
+  const normalizeFrame = (imageData) => {
+    // Your model's normalization parameters
+    const mean = [0.485, 0.456, 0.406];
+    const std = [0.229, 0.224, 0.225];
+    
+    const data = imageData.data;
+    const normalized = [];
+    
+    // Convert to RGB and normalize (ImageData is RGBA)
+    for (let i = 0; i < data.length; i += 4) {
+      const r = (data[i] / 255.0 - mean[0]) / std[0];
+      const g = (data[i + 1] / 255.0 - mean[1]) / std[1];
+      const b = (data[i + 2] / 255.0 - mean[2]) / std[2];
+      normalized.push(r, g, b);
+    }
+    
+    return normalized;
+  };
+
+  const sendToModel = async () => {
+    if (frames.length !== 60) {
+      alert('Please extract 60 frames first');
+      return;
+    }
+
+    setPredicting(true);
+    
+    try {
+      // Prepare frames in the format your model expects
+      // Shape: [1, 60, 3, 224, 224] (batch_size=1, seq_len=60, channels=3, H=224, W=224)
+      const processedFrames = frames.map(frame => normalizeFrame(frame.imageData));
+      
+      // Create the payload for your model
+      const payload = {
+        frames: processedFrames,
+        shape: [1, 60, 3, 224, 224]  // Batch size 1, 60 frames, 3 channels, 224x224
+      };
+
+      // Send to your PyTorch model endpoint
+      // Replace with your actual Flask/FastAPI endpoint
+      const response = await fetch('http://localhost:5000/predict', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload)
+      });
+
+      if (!response.ok) {
+        throw new Error('Model prediction failed');
+      }
+
+      const prediction = await response.json();
+      
+      // Expected response format: { predicted_class: 0 or 1, confidence: [prob_0, prob_1] }
+      setResult({
+        accident_detected: prediction.predicted_class === 1,
+        confidence: Math.max(...prediction.confidence),
+        raw_output: prediction,
+        timestamp: new Date().toISOString()
+      });
+
+    } catch (error) {
+      console.error('Error predicting:', error);
+      
+      // Fallback: Show simulated result with instructions
+      alert('Cannot connect to model server. Please ensure your Flask/FastAPI server is running on http://localhost:5000');
+      
+      // Show mock result for demonstration
+      const mockPrediction = {
+        accident_detected: Math.random() > 0.6,
+        confidence: (Math.random() * 0.3 + 0.7),
+        timestamp: new Date().toISOString(),
+        demo_mode: true
+      };
+      setResult(mockPrediction);
+    } finally {
+      setPredicting(false);
+    }
+  };
+
+  const downloadFramesAsJSON = () => {
+    const processedFrames = frames.map((frame, idx) => ({
+      frame_number: idx,
+      data: normalizeFrame(frame.imageData)
+    }));
+
+    const dataStr = JSON.stringify({
+      num_frames: 60,
+      shape: [60, 3, 224, 224],
+      frames: processedFrames
+    }, null, 2);
+
+    const dataBlob = new Blob([dataStr], { type: 'application/json' });
+    const url = URL.createObjectURL(dataBlob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'extracted_frames.json';
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const reset = () => {
+    setVideoFile(null);
+    setVideoURL(null);
+    setFrames([]);
+    setResult(null);
+    setProgress(0);
+    setProcessing(false);
+    setPredicting(false);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
+  };
+
   return (
-    <>
-      return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 p-6">
       <div className="max-w-6xl mx-auto">
         <div className="bg-slate-800 rounded-2xl shadow-2xl overflow-hidden border border-slate-700">
@@ -51,11 +255,16 @@ function App() {
                 </h3>
                 <video
                   ref={videoRef}
-                  src={videoURL}
                   className="w-full rounded-lg"
                   controls
                   preload="metadata"
-                />
+                  crossOrigin="anonymous"
+                >
+                  <source src={videoURL} type="video/mp4" />
+                  <source src={videoURL} type="video/mov" />
+                  <source src={videoURL} type="video/ogg" />
+                  Your browser does not support the video tag.
+                </video>
                 <canvas ref={canvasRef} className="hidden" />
               </div>
             )}
@@ -189,54 +398,10 @@ function App() {
             {/* Server Setup Instructions */}
             <div className="bg-slate-700 rounded-xl p-6 text-slate-300 text-sm">
               <h4 className="text-white font-semibold mb-3 text-lg">Backend Server Setup:</h4>
-              <p className="mb-3">To connect this interface to your CNN-LSTM model, create a Flask server:</p>
+              <p className="mb-3">To connect this interface to your CNN-LSTM model, create a Flask server</p>
               
-              <div className="bg-slate-900 rounded p-4 mb-3 font-mono text-xs overflow-x-auto">
-{`from flask import Flask, request, jsonify
-from flask_cors import CORS
-import torch
-import numpy as np
+        
 
-app = Flask(__name__)
-CORS(app)
-
-# Load your trained model
-model = CNN_LSTM(num_classes=2, hidden_dim=128)
-model.load_state_dict(torch.load('model.pth'))
-model.eval()
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model.to(device)
-
-@app.route('/predict', methods=['POST'])
-def predict():
-    data = request.json
-    frames = np.array(data['frames']).reshape(1, 60, 3, 224, 224)
-    frames_tensor = torch.FloatTensor(frames).to(device)
-    
-    with torch.no_grad():
-        output = model(frames_tensor)
-        probs = torch.softmax(output, dim=1)
-        predicted_class = torch.argmax(probs, dim=1).item()
-        confidence = probs[0].cpu().numpy().tolist()
-    
-    return jsonify({
-        'predicted_class': predicted_class,
-        'confidence': confidence
-    })
-
-if __name__ == '__main__':
-    app.run(port=5000, debug=True)`}
-              </div>
-
-              <p className="mb-2">Install dependencies:</p>
-              <div className="bg-slate-900 rounded p-3 mb-3 font-mono text-xs">
-                pip install flask flask-cors torch torchvision numpy
-              </div>
-
-              <p className="mb-2">Run the server:</p>
-              <div className="bg-slate-900 rounded p-3 font-mono text-xs">
-                python server.py
-              </div>
             </div>
 
             {/* Usage Instructions */}
@@ -253,8 +418,8 @@ if __name__ == '__main__':
           </div>
         </div>
       </div>
-    </div> 
-    </>);
+    </div>
+  );
 }
 
 export default App;
